@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>rsync · 文件同步</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="rsync 首页"><span class="brand-mark">R</span><span>rsync</span></a>
+      <form method="post" action="/api/control"><input id="sync-action" type="hidden" name="action" value="{% if status.first_sync_confirmed %}sync{% else %}confirm{% endif %}"><button id="sync-button" class="button button-primary" type="submit">{% if status.first_sync_confirmed %}立即同步{% else %}确认并开始首次同步{% endif %}</button></form>
+    </div>
+  </header>
+
+  <main class="page">
+    <h1 class="sr-only">同步总览</h1>
+
+    <section class="metrics" aria-label="同步概况">
+      <div class="metric-card connection-card"><span>连接状态</span><div class="status-value"><span id="connection-indicator" class="status-dot{% if !connected %} offline{% endif %}"></span><strong id="connection">{{ connection_label }}</strong></div><div class="connection-meta"><code id="target-address" title="{{ address }}">{{ address }}</code><span id="paused-flag">{% if status.paused %}已暂停{% else %}运行中{% endif %}</span></div></div>
+      <div class="metric-card" title="包含无需传输的已同步文件；本轮校对完成后归零"><span>待校对文件</span><strong id="pending_files">{{ status.pending_files }}</strong></div>
+      <div class="metric-card"><span>传输速度</span><strong id="transfer_bps">0 B/s</strong></div>
+      <div class="metric-card"><span>上次文件数</span><strong id="last_files">{{ status.last_files }}</strong></div>
+    </section>
+
+    <div class="two-columns">
+      <section class="panel control-panel" aria-labelledby="controls-title">
+        <div class="panel-head"><h2 id="controls-title">同步控制</h2><p>{% if status.first_sync_confirmed %}暂停会在当前传输结束后生效。{% else %}首次同步前先设置排除规则，再点击右上角确认。{% endif %}</p></div>
+        <div class="data-list">
+          <div><span>上次成功同步</span><strong id="last_success">{{ last_success_display }}</strong></div>
+          <div><span>重新计算哈希</span><strong id="last_scan_hashed">{{ status.last_scan_hashed }}</strong></div>
+          <div><span>复用缓存</span><strong id="last_scan_cached">{{ status.last_scan_cached }}</strong></div>
+          <div><span>扫描线程</span><strong id="last_scan_workers">{{ status.last_scan_workers }}</strong></div>
+        </div>
+        <div class="panel-actions"><form method="post" action="/api/control"><input id="pause-action" type="hidden" name="action" value="{% if status.paused %}resume{% else %}pause{% endif %}"><button id="pause-button" class="button button-secondary" type="submit">{% if status.paused %}恢复自动同步{% else %}暂停自动同步{% endif %}</button></form></div>
+      </section>
+
+      <section id="settings-connection" class="panel" aria-labelledby="connection-title">
+        <div class="panel-head"><h2 id="connection-title">连接设置</h2><p>主机主动连接目标地址；留空时只运行本机页面。</p></div>
+        <form class="connection-form" method="post" action="/api/source-connection"><label class="field"><span>目标地址 <small>IP:端口</small></span><input id="target-input" name="addr" type="text" value="{{ target_value }}" placeholder="从机 IP:端口" autocomplete="off" spellcheck="false"></label><button class="button button-primary" type="submit">保存连接</button></form>
+        <div class="connection-hint"><span>证书配对</span><strong id="pairing-state">{% if status.peer_configured %}已配对{% else %}未配对{% endif %}</strong></div>
+        <details id="settings-peer" class="peer-details">
+          <summary>更换从机证书</summary>
+          <p>连接另一台从机前，核对其 CA 指纹并导入证书。对方也需要信任主机 CA。</p>
+          <form method="post" action="/api/source-peer"><label class="field"><span>从机 CA 证书</span><textarea name="certificate" rows="5" placeholder="粘贴 PEM 证书" required spellcheck="false"></textarea></label><label class="field"><span>从机 CA 指纹</span><input name="fingerprint" type="text" maxlength="64" placeholder="64 位 BLAKE3 指纹" required autocomplete="off" spellcheck="false"></label><button class="button button-secondary" type="submit">导入证书</button></form>
+          <div class="ca-info"><span>主机 CA 指纹</span><code>{{ source_ca_fingerprint }}</code><a href="/api/source-ca">下载主机 CA 证书</a></div>
+        </details>
+      </section>
+    </div>
+
+    <div class="two-columns settings-grid">
+      <section id="settings-source" class="panel settings-panel" aria-labelledby="source-title">
+        <div class="panel-head"><h2 id="source-title">主机配置</h2></div>
+        <div class="identity-list"><div><span>同步目录</span><code>{{ root }}</code></div><div><span>Web 监听</span><code>{{ source.web_addr }}</code></div><div><span>程序版本</span><code>{{ status.source_version }}</code></div></div>
+        <form class="settings-form" method="post" action="/api/source-settings"><div class="field-grid">
+          <label class="field"><span>全量扫描周期 <small>秒</small></span><input name="scan_interval_secs" type="number" min="1" max="86400" value="{{ source.scan_interval_secs }}" required></label>
+          <label class="field"><span>哈希线程上限 <small>个</small></span><input name="hash_workers" type="number" min="1" max="8" value="{{ source.hash_workers }}" required></label>
+          <label class="field"><span>完整校验周期 <small>秒</small></span><input name="verify_interval_secs" type="number" min="1" max="31536000" value="{{ source.verify_interval_secs }}" required></label>
+        </div><div class="form-actions"><button class="button button-primary" type="submit">保存主机配置</button></div></form>
+      </section>
+
+      <section id="settings-replica" class="panel settings-panel" aria-labelledby="replica-title">
+        <div class="panel-head panel-head-inline"><h2 id="replica-title">从机配置</h2><span id="replica-availability" class="availability">{% if replica_available %}已连接{% else %}未连接{% endif %}</span></div>
+        <div class="identity-list"><div><span>同步目录</span><code id="replica-root">{{ replica_root }}</code></div><div><span>监听地址</span><code id="replica-addr">{{ replica_addr }}</code></div><div><span>程序版本</span><code id="replica-version">{{ replica_version }}</code></div></div>
+        <form id="replica-history-form" class="history-setting" method="post" action="/api/replica-history"><div><strong>历史备份</strong><p id="history-help">{% if replica_available %}关闭后不再保存新的旧版本，已有历史保留{% else %}连接后可设置历史备份{% endif %}</p></div><button id="replica-history-switch" class="history-switch {% if history_enabled %}is-on{% endif %}" type="submit" role="switch" aria-label="历史备份" aria-checked="{% if history_enabled %}true{% else %}false{% endif %}" name="enabled" value="{% if history_enabled %}false{% else %}true{% endif %}" {% if !replica_available %}disabled{% endif %}><span class="history-switch-knob" aria-hidden="true"></span></button></form>
+        <form class="settings-form" method="post" action="/api/replica-settings"><div class="field-grid">
+          <label class="field"><span>历史保留 <small>天，0 为关闭</small></span><input id="replica-retention" name="retention_days" type="number" min="0" max="3650" value="{{ replica_retention_days }}" required {% if !replica_available %}disabled{% endif %}></label>
+          <label class="field"><span>完整校验周期 <small>秒</small></span><input id="replica-verify" name="verify_interval_secs" type="number" min="1" max="31536000" value="{{ replica_verify_interval_secs }}" required {% if !replica_available %}disabled{% endif %}></label>
+        </div><div class="upgrade-setting"><p id="upgrade-help">{% if upgrade_available %}由主机传送当前版本，有更新时从机自动重启{% else %}从机需先手动安装支持远程升级的版本{% endif %}</p><p id="upgrade-state" class="upgrade-state" hidden></p><progress id="upgrade-progress" max="100" value="0" hidden></progress></div><div class="form-actions"><button id="upgrade-open" class="button button-secondary" type="button" {% if !upgrade_available %}disabled{% endif %}>一键升级</button><button id="replica-save" class="button button-primary" type="submit" {% if !replica_available %}disabled{% endif %}>保存从机配置</button></div></form>
+      </section>
+    </div>
+
+    <section id="settings-exclusions" class="panel exclusions" aria-labelledby="exclusions-title">
+      <div class="panel-head panel-head-inline"><div><h2 id="exclusions-title">排除规则</h2><p>填写相对路径，或用 **/.vscode 排除任意层级同名目录。新规则会中断当前同步并重新扫描；已传输的排除文件需在从机手动清理。</p></div><span class="rule-count">{{ excludes.len() }} 条</span></div>
+      <form class="exclude-form" method="post" action="/api/excludes"><input type="hidden" name="action" value="add"><label class="sr-only" for="exclude-path">排除路径</label><input id="exclude-path" name="path" type="text" maxlength="4096" required placeholder="例如 **/.vscode 或 project/cache" autocomplete="off"><button class="button button-primary" type="submit">添加规则</button></form>
+      {% if excludes.is_empty() %}<div class="empty-state">暂无排除规则</div>{% else %}<div class="rule-list">{% for path in excludes %}<div class="rule-row"><code>{{ path }}</code><form method="post" action="/api/excludes"><input type="hidden" name="action" value="remove"><input type="hidden" name="path" value="{{ path }}"><button class="text-button" type="submit" aria-label="移除 {{ path }}">移除</button></form></div>{% endfor %}</div>{% endif %}
+    </section>
+
+  </main>
+  <dialog id="upgrade-dialog" class="confirm-dialog" aria-labelledby="upgrade-dialog-title"><div class="dialog-content"><h2 id="upgrade-dialog-title">升级从机程序</h2><p id="upgrade-dialog-detail">将主机程序传送到从机，校验后覆盖安装；有更新时从机自动重启。当前同步会在安全检查点中断，之后续传。</p><form id="upgrade-form" method="post" action="/api/replica-upgrade"><input id="upgrade-target" type="hidden" name="target" value="{{ target_value }}"><input id="upgrade-version" type="hidden" name="version" value="{% if replica_available %}{{ replica_version }}{% endif %}"><div class="dialog-actions"><button id="upgrade-cancel" class="button button-secondary" type="button">取消</button><button class="button button-primary" type="submit">确认升级</button></div></form></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" {% if notice.is_empty() %}hidden{% endif %}>{{ notice }}</div>
+</body>
+</html>

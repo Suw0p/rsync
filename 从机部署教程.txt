@@ -1,0 +1,104 @@
+rsync 1.0.0 从机手动升级教程（现有 .rsync 状态目录）
+====================================================
+
+本教程在从机以 root 执行，假设：
+- 已将本项目的 rsync 1.0.0 程序手动放入 /root/rsync。
+- 同步目录为 /root/a5，已有 /root/a5/.rsync。
+- 程序安装到 /root/.local/libexec/rsync/rsync。
+- systemd 服务名为 rsync-a5.service，同步端口为 TCP 22000。
+路径、服务名与端口不同的部署，请替换成实际值。
+
+升级保留现有数据库、证书、排除设置、历史备份与从机独有文件。
+不要执行 init，不要删除或改名 .rsync，不要复制主机的状态目录。
+本项目程序与系统 rsync 命令同名，以下命令始终使用绝对路径。
+
+1. 核对新程序与现有配置
+-----------------------
+
+test -f /root/rsync
+test -d /root/a5/.rsync
+chmod 0755 /root/rsync
+/root/rsync --version
+sha256sum /root/rsync
+/root/rsync status --root /root/a5
+
+版本应为 rsync 1.0.0，角色应为 replica。
+将 SHA-256 与发布包 SHA256SUMS 中对应程序的值比对。
+若程序无法运行或状态检查报错，先确认操作系统、状态库与配置，
+不要继续替换。程序未包含旧数据库结构的迁移逻辑。
+
+2. 停止现有服务并安装
+---------------------
+
+systemctl stop rsync-a5.service
+systemctl is-active rsync-a5.service
+
+确认状态为 inactive 后执行：
+
+install -d -m 0755 /root/.local/libexec/rsync
+if [ -f /root/.local/libexec/rsync/rsync ]; then
+    cp -p /root/.local/libexec/rsync/rsync /root/.local/libexec/rsync/rsync.previous
+fi
+install -m 0755 /root/rsync /root/.local/libexec/rsync/rsync.new
+mv -f /root/.local/libexec/rsync/rsync.new /root/.local/libexec/rsync/rsync
+/root/.local/libexec/rsync/rsync --version
+/root/.local/libexec/rsync/rsync status --root /root/a5
+
+3. 核对 systemd 服务
+--------------------
+
+systemctl cat rsync-a5.service
+
+现有服务的 ExecStart 应指向：
+/root/.local/libexec/rsync/rsync run --root /root/a5
+并设置 Restart=always。
+
+若需要创建或更新服务定义，执行：
+
+cat > /etc/systemd/system/rsync-a5.service <<'UNIT'
+[Unit]
+Description=rsync replica (a5)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/root/.local/libexec/rsync/rsync run --root /root/a5
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now rsync-a5.service
+systemctl status rsync-a5.service --no-pager
+
+若保留现有服务定义，则执行：
+systemctl start rsync-a5.service
+
+4. 检查监听与同步
+-----------------
+
+ss -ltnp | grep ':22000'
+/root/.local/libexec/rsync/rsync status --root /root/a5
+journalctl -u rsync-a5.service -n 100 --no-pager
+
+从机只监听同步端口，不运行 Web。防火墙和云安全组只需允许主机
+实际出口 IP 访问该 TCP 端口。主机未连接时，从机保持监听并保留文件。
+
+主机 Web 地址：http://主机IP:8787/，请替换为实际可达地址。
+建议两端均使用 1.0.0；同步要求双方协议版本和能力匹配。
+从机独有文件保留；主机同路径普通文件会覆盖从机版本，主机删除
+曾同步的文件或目录时会按归属记录清理，独有内容不删除。
+
+5. 后续一键升级
+---------------
+
+先更新并重启主机，随后在主机页面“从机配置”点击“一键升级”并确认。
+主机会传送自身当前运行的程序，从机核验后替换安装文件并退出，
+由 systemd 重启；主机重新连接后显示升级结果。
+该操作会短暂断开同步连接，未完成的任务会重试，不是零中断升级。

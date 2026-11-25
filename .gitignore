@@ -1,0 +1,16 @@
+# Build and release artifacts
+/target/
+/dist/
+
+# Sync state, databases and node certificates
+**/.rsync/
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+
+# Local secrets
+.env
+.env.*
+!.env.example
