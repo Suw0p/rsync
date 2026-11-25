@@ -21,7 +21,7 @@
 
     <section class="metrics" aria-label="同步概况">
       <div class="metric-card connection-card"><span>连接状态</span><div class="status-value"><span id="connection-indicator" class="status-dot{% if !connected %} offline{% endif %}"></span><strong id="connection">{{ connection_label }}</strong></div><div class="connection-meta"><code id="target-address" title="{{ address }}">{{ address }}</code><span id="paused-flag">{% if status.paused %}已暂停{% else %}运行中{% endif %}</span></div></div>
-      <div class="metric-card" title="包含无需传输的已同步文件；本轮校对完成后归零"><span>待校对文件</span><strong id="pending_files">{{ status.pending_files }}</strong></div>
+      <div class="metric-card" title="扫描完成后显示待校对数量，包含无需传输的已同步文件；本轮校对完成后归零"><span>待校对文件</span><strong id="pending_files">{% if status.scan.active %}扫描中{% else %}{{ status.pending_files }}{% endif %}</strong><span id="scan-progress" class="scan-progress">{% if status.scan.active %}{% if status.scan.checking_inventory %}检查目录{% else %}扫描文件{% endif %} · 已发现 {{ status.scan.files }} 个文件 · {{ status.scan.elapsed_secs }} 秒{% endif %}</span></div>
       <div class="metric-card"><span>传输速度</span><strong id="transfer_bps">0 B/s</strong></div>
       <div class="metric-card"><span>上次文件数</span><strong id="last_files">{{ status.last_files }}</strong></div>
     </section>

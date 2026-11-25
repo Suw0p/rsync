@@ -1,6 +1,6 @@
 use crate::{
     config::{self, Config, Role},
-    identity, state,
+    identity, scan, state,
     wire::ReplicaSettings,
 };
 use anyhow::{Context, Result, ensure};
@@ -234,6 +234,7 @@ struct AppState {
     upgrade: UpgradeCache,
     settings_revision: Arc<AtomicU64>,
     transfer_meter: Arc<TransferMeter>,
+    scan: Arc<scan::ScanProgress>,
 }
 
 pub enum Control {
@@ -260,6 +261,7 @@ struct Status {
     first_sync_confirmed: bool,
     paused: bool,
     pending_files: String,
+    scan: scan::ScanStatus,
     last_success: String,
     last_error: String,
     last_files: String,
@@ -357,6 +359,7 @@ pub fn start(
     config: &Config,
     settings_revision: Arc<AtomicU64>,
     transfer_meter: Arc<TransferMeter>,
+    scan: Arc<scan::ScanProgress>,
 ) -> Result<(mpsc::Receiver<Control>, ReplicaCache, UpgradeCache)> {
     ensure!(config.role == Role::Source, "web is source-only");
     let listener = std::net::TcpListener::bind(config.web_addr)
@@ -373,6 +376,7 @@ pub fn start(
         upgrade: upgrade.clone(),
         settings_revision,
         transfer_meter,
+        scan,
     };
     thread::Builder::new()
         .name("rsync-web".into())
@@ -476,6 +480,9 @@ fn internal(error: impl std::fmt::Display) -> (StatusCode, String) {
 }
 
 fn read_status(app: &AppState) -> Result<Status> {
+    // Snapshot the scan phase first: an inactive phase is published only after
+    // its pending count is committed, so later SQL reads cannot return the old zero.
+    let scan = app.scan.snapshot();
     let config = Config::load(app.root.clone())?;
     let db = state::open_readonly(&config)?;
     let get = |key: &str| -> Result<String> { Ok(state::get(&db, key)?.unwrap_or_default()) };
@@ -486,7 +493,12 @@ fn read_status(app: &AppState) -> Result<Status> {
         peer_configured: config.peer_path().is_file(),
         first_sync_confirmed: config.first_sync_confirmed,
         paused: config.pause_path().exists(),
-        pending_files: get("pending_files")?,
+        pending_files: if scan.active {
+            String::new()
+        } else {
+            get("pending_files")?
+        },
+        scan,
         last_success: get("last_success")?,
         last_error: get("last_error")?,
         last_files: get("last_files")?,
@@ -511,6 +523,7 @@ async fn index(
     let config = Config::load(app.root.clone()).map_err(internal)?;
     let status = read_status(&app).map_err(internal)?;
     let connection_label = match status.connection.as_str() {
+        _ if status.scan.active => "正在扫描",
         "idle" | "connected" => "已连接",
         "syncing" => "正在同步",
         "connecting" => "正在连接",

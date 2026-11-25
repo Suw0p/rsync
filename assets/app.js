@@ -101,14 +101,19 @@ async function refreshStatus() {
     const response = await fetch('/api/status', { cache: 'no-store' });
     if (!response.ok) return null;
     const status = await response.json();
-    setText('connection', connectionLabels[status.connection] || status.connection);
+    setText('connection', status.scan.active ? '正在扫描' : connectionLabels[status.connection] || status.connection);
     setText('target-address', status.target || '未设置');
     setText('pairing-state', status.peer_configured ? '已配对' : '未配对');
     const syncAction = document.getElementById('sync-action');
     if (syncAction) syncAction.value = status.first_sync_confirmed ? 'sync' : 'confirm';
     setText('sync-button', status.first_sync_confirmed ? '立即同步' : '确认并开始首次同步');
     setText('paused-flag', status.paused ? '已暂停' : '运行中');
-    for (const key of ['pending_files', 'last_files', 'last_scan_hashed', 'last_scan_cached', 'last_scan_workers']) {
+    setText('pending_files', status.scan.active ? '扫描中' : status.pending_files);
+    const scanProgress = document.getElementById('scan-progress');
+    if (scanProgress) scanProgress.textContent = status.scan.active
+      ? `${status.scan.checking_inventory ? '检查目录' : '扫描文件'} · 已发现 ${status.scan.files.toLocaleString('zh-CN')} 个文件 · ${status.scan.elapsed_secs} 秒`
+      : '';
+    for (const key of ['last_files', 'last_scan_hashed', 'last_scan_cached', 'last_scan_workers']) {
       setText(key, status[key]);
     }
     setText('transfer_bps', `${humanBytes(status.transfer_bps)}/s`);

@@ -8,6 +8,11 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 use walkdir::{DirEntry, WalkDir};
 
@@ -16,6 +21,71 @@ const LARGE_FILE: u64 = 256 * 1024 * 1024;
 pub const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 pub const SMALL_BATCH_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 const HASH_READ_SIZE: usize = 256 * 1024;
+
+#[derive(Default)]
+pub struct ScanProgress {
+    files: AtomicU64,
+    window: Mutex<ScanWindow>,
+}
+
+#[derive(Default)]
+struct ScanWindow {
+    started: Option<Instant>,
+    checking_inventory: bool,
+}
+
+#[derive(Serialize)]
+pub struct ScanStatus {
+    pub active: bool,
+    pub checking_inventory: bool,
+    pub files: u64,
+    pub elapsed_secs: u64,
+}
+
+pub struct ScanGuard<'a>(&'a ScanProgress);
+
+impl ScanProgress {
+    pub fn begin(&self) -> ScanGuard<'_> {
+        let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        self.files.store(0, Ordering::Relaxed);
+        window.started = Some(Instant::now());
+        window.checking_inventory = false;
+        ScanGuard(self)
+    }
+
+    fn phase(&self, checking_inventory: bool) {
+        let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        self.files.store(0, Ordering::Relaxed);
+        window.checking_inventory = checking_inventory;
+    }
+
+    fn found_file(&self) {
+        self.files.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ScanStatus {
+        let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        ScanStatus {
+            active: window.started.is_some(),
+            checking_inventory: window.checking_inventory,
+            files: self.files.load(Ordering::Relaxed),
+            elapsed_secs: window
+                .started
+                .map_or(0, |started| started.elapsed().as_secs()),
+        }
+    }
+}
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        // Clear the live indicator on success, scan failure or interruption.
+        self.0
+            .window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .started = None;
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,7 +188,10 @@ fn include_source_entry(entry: &DirEntry, config: &Config, exclusions: &Exclusio
     !exclusions.contains(relative)
 }
 
-fn inventory_fingerprint(config: &Config) -> Result<(String, Vec<String>)> {
+fn inventory_fingerprint(
+    config: &Config,
+    progress: &ScanProgress,
+) -> Result<(String, Vec<String>)> {
     // This cheap tree walk hashes paths, types and file stamps, not file contents.
     // It is only a manifest-cache hint; scheduled verification still rehashes files.
     let exclusions = ExclusionIndex::new(&config.excludes);
@@ -164,6 +237,7 @@ fn inventory_fingerprint(config: &Config) -> Result<(String, Vec<String>)> {
                 1,
                 Some(&FileStamp::from_metadata(&meta)),
             );
+            progress.found_file();
         } else if kind.is_symlink() {
             hash_entry(&mut hasher, relative, 2, None);
             skipped_symlinks.push(relative.to_owned());
@@ -384,6 +458,7 @@ pub fn prepare_manifest(
     force_hash: bool,
     known_changed: bool,
     collect_delta: bool,
+    progress: &ScanProgress,
 ) -> Result<ScanStats> {
     config.check_root()?;
     // On restart, an unchanged tree can reuse the stored manifest without reading
@@ -392,7 +467,8 @@ pub fn prepare_manifest(
         && !known_changed
         && let Some(previous) = crate::state::get(db, "inventory_fingerprint")?
     {
-        let (fingerprint, skipped_symlinks) = inventory_fingerprint(config)?;
+        progress.phase(true);
+        let (fingerprint, skipped_symlinks) = inventory_fingerprint(config, progress)?;
         if previous == fingerprint {
             crate::state::set(
                 db,
@@ -410,6 +486,7 @@ pub fn prepare_manifest(
             });
         }
     }
+    progress.phase(false);
     let transaction = db.transaction()?;
     transaction.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS scan_seen(path TEXT PRIMARY KEY);
@@ -472,6 +549,7 @@ pub fn prepare_manifest(
                 path.display()
             );
             let current = FileStamp::from_metadata(&current_meta);
+            progress.found_file();
             hash_entry(&mut inventory, &relative, 1, Some(&current));
             let cached: Option<Vec<u8>> = if force_hash {
                 None
@@ -745,13 +823,14 @@ fn update_delta_entry(
     Ok(changed)
 }
 
-struct DeltaBatch {
+struct DeltaBatch<'a> {
     pending: Vec<Pending>,
     workers: usize,
     pool: Option<rayon::ThreadPool>,
+    progress: &'a ScanProgress,
 }
 
-impl DeltaBatch {
+impl DeltaBatch<'_> {
     fn flush(&mut self, db: &Connection, stats: &mut ScanStats) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -828,7 +907,7 @@ fn add_delta_entry(
     relative: &str,
     direct_event: bool,
     stats: &mut ScanStats,
-    batch: &mut DeltaBatch,
+    batch: &mut DeltaBatch<'_>,
 ) -> Result<()> {
     crate::config::valid_relative(relative)?;
     let metadata = fs::symlink_metadata(path)?;
@@ -837,6 +916,7 @@ fn add_delta_entry(
     } else if metadata.is_dir() {
         update_delta_entry(db, relative, 0, None, None)?;
     } else if metadata.is_file() {
+        batch.progress.found_file();
         // Directory notifications may include unchanged children. A direct file notification
         // is always hashed so a timestamp-only change cannot hide edited content.
         let stamp = serde_json::to_vec(&FileStamp::from_metadata(&metadata))?;
@@ -866,7 +946,12 @@ fn add_delta_entry(
 }
 
 /// Update only paths reported by the file watcher. The daily full scan repairs missed events.
-pub fn prepare_delta(config: &Config, db: &mut Connection, paths: &[String]) -> Result<ScanStats> {
+pub fn prepare_delta(
+    config: &Config,
+    db: &mut Connection,
+    paths: &[String],
+    progress: &ScanProgress,
+) -> Result<ScanStats> {
     config.check_root()?;
     let transaction = db.transaction()?;
     transaction.execute_batch(
@@ -898,6 +983,7 @@ pub fn prepare_delta(config: &Config, db: &mut Connection, paths: &[String]) -> 
         pending: Vec::with_capacity(SCAN_BATCH),
         workers: config.hash_workers,
         pool: None,
+        progress,
     };
     let mut after = String::new();
     loop {

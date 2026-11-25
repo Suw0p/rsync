@@ -192,6 +192,7 @@ struct TransferContext<'a> {
     revision: &'a AtomicU64,
     expected_revision: u64,
     meter: &'a web::TransferMeter,
+    scan: &'a scan::ScanProgress,
 }
 
 struct SourcePass<'a> {
@@ -449,11 +450,16 @@ pub async fn run_source(config: Config, db: Connection, once: bool) -> Result<()
     }
     let settings_revision = Arc::new(AtomicU64::new(0));
     let transfer_meter = Arc::new(web::TransferMeter::default());
+    let scan_progress = Arc::new(scan::ScanProgress::default());
     let (mut controls, replica_cache, upgrade_cache) = if once {
         (None, None, None)
     } else {
-        let (rx, replica, upgrade) =
-            web::start(&config, settings_revision.clone(), transfer_meter.clone())?;
+        let (rx, replica, upgrade) = web::start(
+            &config,
+            settings_revision.clone(),
+            transfer_meter.clone(),
+            scan_progress.clone(),
+        )?;
         (Some(rx), Some(replica), Some(upgrade))
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -721,6 +727,7 @@ pub async fn run_source(config: Config, db: Connection, once: bool) -> Result<()
                     revision: &settings_revision,
                     expected_revision: revision,
                     meter: &transfer_meter,
+                    scan: &scan_progress,
                 };
                 let mut scan_committed = false;
                 let result = async {
@@ -966,8 +973,16 @@ async fn source_once<S: AsyncRead + AsyncWrite + Unpin>(
         if full { "full" } else { "delta" },
     )?;
     let scan_started = Instant::now();
+    let scan_guard = ctx.scan.begin();
     let scan_stats = if full || resume_delta {
-        let stats = scan::prepare_manifest(config, db, full_verify, known_changed, resume_delta)?;
+        let stats = scan::prepare_manifest(
+            config,
+            db,
+            full_verify,
+            known_changed,
+            resume_delta,
+            ctx.scan,
+        )?;
         if !stats.reused_manifest
             && let Err(error) = state::checkpoint(db)
         {
@@ -979,7 +994,7 @@ async fn source_once<S: AsyncRead + AsyncWrite + Unpin>(
         stats
     } else {
         let paths: Vec<_> = changed_paths.iter().cloned().collect();
-        scan::prepare_delta(config, db, &paths)?
+        scan::prepare_delta(config, db, &paths, ctx.scan)?
     };
     *scan_committed = true;
     // The committed outbox now owns recovery. Release the watcher snapshot
@@ -1039,6 +1054,9 @@ async fn source_once<S: AsyncRead + AsyncWrite + Unpin>(
         scan_stats.files
     };
     state::set(db, "pending_files", total_files.to_string())?;
+    // Publish the count before clearing the in-memory scan phase. A web poll
+    // must not show the previous round's zero between scan and reconciliation.
+    drop(scan_guard);
     if !full
         && !pending_delta
         && scan::delta_entry_count(db)? == 0
